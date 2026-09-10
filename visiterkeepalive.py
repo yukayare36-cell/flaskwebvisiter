@@ -1,4 +1,5 @@
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
@@ -17,9 +18,11 @@ import shutil
 TARGET_URL = "https://freecash.pythonanywhere.com"
 VISIT_DURATION_MINUTES = 5
 WAIT_BETWEEN_MINUTES = 10
-PAGE_LOAD_TIMEOUT_SECONDS = 30     # fail fast instead of hanging
-MAX_VISIT_RETRIES = 3              # retries within one cycle before giving up
-RETRY_DELAY_SECONDS = 20           # wait between retries
+PAGE_LOAD_TIMEOUT_SECONDS = 30
+MAX_VISIT_RETRIES = 3
+RETRY_DELAY_SECONDS = 20
+HEADLESS_REFRESH_SECONDS = 60        # refresh the headless browser page every N sec
+AUTOREFRESH_MS = 2000                # Streamlit self-rerun interval (ms)
 # =======================================
 
 st.set_page_config(page_title="Selenium Scheduler", layout="wide")
@@ -50,11 +53,12 @@ def pip_install(package, quiet=True):
 
 @st.cache_resource(show_spinner=False)
 def ensure_python_deps():
-    for pkg in ['selenium']:
+    for pkg, pip_name in [('selenium', 'selenium'),
+                          ('streamlit_autorefresh', 'streamlit-autorefresh')]:
         try:
             importlib.import_module(pkg)
         except ImportError:
-            pip_install(pkg)
+            pip_install(pip_name)
     return True
 
 
@@ -143,7 +147,7 @@ def create_driver(chrome_path):
         return None
 
 
-# ---------- One visit (with retries) ----------
+# ---------- One visit (with retries + periodic refresh) ----------
 def _single_visit_attempt(chrome_path):
     """One attempt. Returns (success, error_message)."""
     driver = create_driver(chrome_path)
@@ -183,11 +187,26 @@ def _single_visit_attempt(chrome_path):
                 log(f"⚠️ Bypass failed: {e}")
 
         log(f"✅ Visit successful. Keeping browser open for "
-            f"{VISIT_DURATION_MINUTES} min...")
+            f"{VISIT_DURATION_MINUTES} min "
+            f"(refreshing every {HEADLESS_REFRESH_SECONDS}s)...")
 
-        end_time = time.time() + VISIT_DURATION_MINUTES * 60
+        visit_start = time.time()
+        end_time = visit_start + VISIT_DURATION_MINUTES * 60
+        last_refresh = visit_start
+
         while time.time() < end_time:
             time.sleep(5)
+
+            # ---- Refresh headless page every N seconds ----
+            if time.time() - last_refresh >= HEADLESS_REFRESH_SECONDS:
+                try:
+                    driver.refresh()
+                    last_refresh = time.time()
+                    title = driver.title
+                    log(f"🔄 Refreshed headless page  (title: {title})")
+                except Exception as e:
+                    log(f"⚠️ Refresh failed: {e}")
+
             if not st.session_state.get("scheduler_enabled", True):
                 break
 
@@ -245,6 +264,10 @@ def init_state():
 
 init_state()
 
+# ---- Force Streamlit to keep rerunning so the app stays alive ----
+# This is what prevents the Community Cloud hibernation timeout
+st_autorefresh(interval=AUTOREFRESH_MS, key="keepalive_refresh")
+
 
 # ---------- Sidebar ----------
 with st.sidebar:
@@ -253,6 +276,7 @@ with st.sidebar:
     st.write(f"**Target URL:** `{TARGET_URL}`")
     st.write(f"**Visit duration:** {VISIT_DURATION_MINUTES} min")
     st.write(f"**Wait between:** {WAIT_BETWEEN_MINUTES} min")
+    st.write(f"**Headless refresh:** every {HEADLESS_REFRESH_SECONDS}s")
     st.write(f"**Max retries / cycle:** {MAX_VISIT_RETRIES}")
 
     if st.button("⏹ Stop scheduler"):
@@ -275,9 +299,8 @@ with st.sidebar:
 
     st.divider()
     st.caption(
-        "Runs automatically. Reloading the page does NOT stop the "
-        "schedule — state is kept in the session. Errors are logged "
-        "and retried automatically."
+        f"Auto-refreshing every {AUTOREFRESH_MS // 1000}s to keep the app "
+        "warm. Reloading the user page does not stop the schedule."
     )
 
 
@@ -293,7 +316,7 @@ else:
         "```\nchromium\nchromium-driver\n```"
     )
 
-status_col, cycle_col, next_col = st.columns(3)
+status_col, cycle_col, next_col, uptime_col = st.columns(4)
 status_col.metric(
     "Status",
     "🟢 Running" if st.session_state.scheduler_enabled else "🔴 Stopped"
@@ -305,6 +328,9 @@ if st.session_state.scheduler_enabled and st.session_state.next_run_at:
     next_col.metric("Next run in", f"{remaining} s")
 else:
     next_col.metric("Next run in", "—")
+
+uptime_s = int(time.time() - st.session_state.last_state_load)
+uptime_col.metric("Session uptime", f"{uptime_s // 60} min")
 
 st.subheader("📜 Logs")
 log_box = st.empty()
@@ -326,18 +352,15 @@ if st.session_state.scheduler_enabled:
             try:
                 visit_site(chrome_path)
             except Exception as e:
-                # Belt-and-braces: should never happen because visit_site
-                # catches everything, but if it does, keep the loop alive.
                 log(f"💥 Unexpected scheduler error (recovered): {e}")
 
-        # Schedule next run no matter what happened
         st.session_state.next_run_at = time.time() + WAIT_BETWEEN_MINUTES * 60
         log(f"😴 Next visit scheduled in {WAIT_BETWEEN_MINUTES} min")
 
         st.rerun()
     else:
-        time.sleep(5)
-        st.rerun()
+        # No manual rerun needed — st_autorefresh handles it
+        pass
 
 
 # ---------- Notes ----------
@@ -345,26 +368,33 @@ with st.expander("ℹ️ How this works"):
     st.markdown("**Behavior**")
     st.markdown(
         "- **Auto-start** — no button needed; the loop begins on load.\n"
-        "- **Reload-safe** — refreshing the page does not stop or reset "
-        "the schedule (state lives in the Streamlit session).\n"
+        "- **Self-refresh** — `st_autorefresh` reruns the app every "
+        f"`{AUTOREFRESH_MS // 1000}s`, which keeps Streamlit Cloud from "
+        "hibernating the app while the tab is open.\n"
+        "- **Headless refresh** — the headless browser reloads the target "
+        f"page every `{HEADLESS_REFRESH_SECONDS}s` during each visit.\n"
         "- **Auto-retry** — a failed visit is retried up to "
         f"`{MAX_VISIT_RETRIES}` times with a `{RETRY_DELAY_SECONDS}s` "
-        "delay, then the loop moves on to the next cycle.\n"
+        "delay.\n"
         "- **Fast-fail** — page load has a "
-        f"`{PAGE_LOAD_TIMEOUT_SECONDS}s` timeout so a dead host "
-        "(like the `ERR_CONNECTION_CLOSED` you saw) won't hang the app."
+        f"`{PAGE_LOAD_TIMEOUT_SECONDS}s` timeout so a dead host won't "
+        "hang the app."
     )
     st.markdown("**Required files**")
     st.code(
         "packages.txt:\nchromium\nchromium-driver\n\n"
-        "requirements.txt:\nstreamlit\nselenium",
+        "requirements.txt:\nstreamlit\nselenium\nstreamlit-autorefresh",
         language="text",
     )
-    st.markdown("**Limitations on Streamlit Cloud**")
+    st.markdown("**About 'running when user leaves'**")
     st.markdown(
-        "- Tab must stay open — the app hibernates after ~15 min idle.\n"
-        "- Reload ≠ session reset *only if* the app hasn't hibernated. "
-        "If it hibernates, `session_state` resets and the cycle counter "
-        "starts over.\n"
-        "- For true 24/7 no-tab running, use GitHub Actions / a worker."
+        "On Streamlit Community Cloud, the app process is killed after "
+        "~15 minutes of inactivity. `st_autorefresh` prevents that "
+        "**only while a browser tab is open somewhere** pointing at the "
+        "app. If every tab is closed, the platform will hibernate the "
+        "app — no code can override that.\n\n"
+        "To keep it warm without any open tab:\n"
+        "- Use a free external pinger (UptimeRobot, cron-job.org) that "
+        "hits your app URL every 5 minutes.\n"
+        "- Or move the scheduler to GitHub Actions / Render worker / VPS."
     )
