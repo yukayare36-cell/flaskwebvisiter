@@ -15,7 +15,7 @@ import shutil
 import threading
 
 # ============ CONFIGURATION ============
-TARGET_URL = "https://example.com"
+TARGET_URL = "https://userwho.loophole.site"
 VISIT_DURATION_MINUTES = 5
 WAIT_BETWEEN_MINUTES = 10
 # =======================================
