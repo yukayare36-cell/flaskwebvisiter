@@ -1,421 +1,380 @@
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.desired_capabilities import DesiredCapabilities
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from flask import Flask, request, jsonify
-import os
 import time
 import subprocess
 import sys
 import importlib
+import datetime
+import signal
+import os
+import platform
+import shutil
 
-app = Flask(__name__)
+# ============ CONFIGURATION ============
+TARGET_URL = "https://example.com"
+VISIT_DURATION_MINUTES = 5
+WAIT_BETWEEN_MINUTES = 10
+# =======================================
 
-# Auto-install dependencies on startup
-def auto_install_requirements():
-    """Automatically install required packages if they're missing"""
-    requirements = [
-        'selenium',
-        'flask',
-        'selenium-wire',  # Optional, but try to install
-    ]
-    
-    print("🔍 Checking and installing required packages...")
-    
-    for package in requirements:
+running = True
+
+def signal_handler(sig, frame):
+    global running
+    print("\n🛑 Shutdown signal received. Exiting after current cycle...")
+    running = False
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+
+def log(msg):
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}")
+
+
+# ============================================================
+#  Package installation
+# ============================================================
+def pip_install(package, quiet=True):
+    cmd = [sys.executable, '-m', 'pip', 'install', package]
+    if quiet:
+        cmd.append('--quiet')
+    try:
+        subprocess.check_call(cmd)
+        return True
+    except subprocess.CalledProcessError as e:
+        log(f"⚠️ pip install {package} failed: {e}")
+        return False
+
+
+def ensure_python_deps():
+    log("🔍 Checking required Python packages...")
+    required = {
+        'selenium': 'selenium',
+        'webdriver_manager': 'webdriver-manager',  # optional fallback
+    }
+    for module, pkg in required.items():
         try:
-            # Try to import the package
-            if package == 'selenium-wire':
-                importlib.import_module('seleniumwire')
-            else:
-                importlib.import_module(package)
-            print(f"✅ {package} is already installed")
+            importlib.import_module(module)
+            log(f"✅ {pkg} is already installed")
         except ImportError:
-            print(f"📦 Installing {package}...")
-            try:
-                # Install the package using pip
+            log(f"📦 Installing {pkg}...")
+            if pip_install(pkg):
+                log(f"✅ Installed {pkg}")
+            else:
+                log(f"⚠️ Could not install {pkg} — continuing anyway")
+
+
+ensure_python_deps()
+
+
+# ============================================================
+#  Chrome / Chromium detection & installation
+# ============================================================
+def find_chrome_binary():
+    """Return path to Chrome/Chromium binary if it exists, else None."""
+    system = platform.system()
+    candidates = []
+
+    if system == "Windows":
+        candidates = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            os.path.expanduser(
+                r"~\AppData\Local\Google\Chrome\Application\chrome.exe"
+            ),
+            r"C:\Program Files\Chromium\Application\chrome.exe",
+            r"C:\Program Files (x86)\Chromium\Application\chrome.exe",
+            os.path.expanduser(
+                r"~\AppData\Local\Chromium\Application\chrome.exe"
+            ),
+        ]
+    elif system == "Darwin":
+        candidates = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            "/Applications/Google Chrome Canary.app/Contents/MacOS/"
+            "Google Chrome Canary",
+        ]
+    else:  # Linux
+        candidates = [
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/snap/bin/chromium",
+        ]
+
+    # First, check the common paths
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+
+    # Then, try PATH lookup
+    for name in ("chromium", "chromium-browser", "google-chrome",
+                 "google-chrome-stable", "chrome"):
+        found = shutil.which(name)
+        if found:
+            return found
+
+    return None
+
+
+def try_install_chromium():
+    """Attempt to install Chromium via the OS package manager."""
+    system = platform.system()
+    log("📦 Chrome/Chromium not found — attempting installation...")
+
+    try:
+        if system == "Windows":
+            # Try winget first, then choco
+            if shutil.which("winget"):
+                log("   ↳ Trying winget install Google.Chrome ...")
                 subprocess.check_call([
-                    sys.executable, 
-                    '-m', 
-                    'pip', 
-                    'install', 
-                    package,
-                    '--quiet'  # Reduce output noise
+                    "winget", "install", "--id", "Google.Chrome",
+                    "-e", "--silent",
+                    "--accept-package-agreements",
+                    "--accept-source-agreements",
                 ])
-                print(f"✅ Successfully installed {package}")
-            except subprocess.CalledProcessError as e:
-                print(f"⚠️ Failed to install {package}: {e}")
-                # Continue even if one package fails
-
-def install_from_requirements_txt():
-    """Alternative method: install from requirements.txt if it exists"""
-    if os.path.exists('requirements.txt'):
-        print("📦 Found requirements.txt, installing dependencies...")
-        try:
-            subprocess.check_call([
-                sys.executable, 
-                '-m', 
-                'pip', 
-                'install', 
-                '-r', 
-                'requirements.txt',
-                '--quiet'
-            ])
-            print("✅ Requirements installed successfully!")
-            return True
-        except subprocess.CalledProcessError as e:
-            print(f"⚠️ Failed to install requirements.txt: {e}")
+                return True
+            if shutil.which("choco"):
+                log("   ↳ Trying choco install googlechrome ...")
+                subprocess.check_call([
+                    "choco", "install", "googlechrome", "-y"
+                ])
+                return True
+            log("   ⚠️ Neither winget nor choco available on this Windows box.")
+            log("   👉 Please install Chrome manually: "
+                "https://www.google.com/chrome/")
             return False
-    return False
 
-# Run auto-installation
-print("=" * 60)
-print("🚀 Starting Selenium Flask Server...")
-print("=" * 60)
+        elif system == "Darwin":
+            if shutil.which("brew"):
+                log("   ↳ Trying brew install --cask chromium ...")
+                subprocess.check_call([
+                    "brew", "install", "--cask", "chromium"
+                ])
+                return True
+            log("   ⚠️ Homebrew not found. "
+                "Install Chrome manually: https://www.google.com/chrome/")
+            return False
 
-# First try requirements.txt
-if not install_from_requirements_txt():
-    # Fallback to manual installation
-    auto_install_requirements()
+        else:  # Linux
+            if os.geteuid() != 0:
+                log("   ⚠️ Not running as root — Linux package install "
+                    "may fail. Trying sudo-less methods first...")
 
-# Now import selenium-wire only if needed (after potential installation)
-try:
-    from seleniumwire import webdriver as wire_driver
-    SELENIUM_WIRE_AVAILABLE = True
-except ImportError:
-    SELENIUM_WIRE_AVAILABLE = False
-    print("⚠️ selenium-wire not available, will use standard driver")
-
-# Initialize Chrome options
-chrome_options = Options()
-chrome_options.add_argument('--headless')  # Headless mode
-chrome_options.add_argument('--no-sandbox')
-chrome_options.add_argument('--disable-dev-shm-usage')
-chrome_options.add_argument('--disable-gpu')
-chrome_options.add_argument('--window-size=1920,1080')
-
-# Set Chrome binary location
-chrome_options.binary_location = '/usr/bin/chromium'
-
-# Add experimental options for headers (works with Chrome 90+)
-chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-chrome_options.add_experimental_option('useAutomationExtension', False)
-
-# Initialize driver with custom capabilities
-def create_driver():
-    """Create driver with proper header injection setup"""
-    try:
-        driver = webdriver.Chrome(options=chrome_options)
-        
-        # Enable Network domain for CDP commands
-        driver.execute_cdp_cmd('Network.enable', {})
-        
-        # Set headers using CDP - this works for ALL requests
-        driver.execute_cdp_cmd('Network.setExtraHTTPHeaders', {
-            'headers': {
-                'ngrok-skip-browser-warning': '1',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 MyApp/1.0'
-            }
-        })
-        
-        print("✅ Browser initialized with ngrok skip headers!")
-        return driver
-    except Exception as e:
-        print(f"❌ Error initializing browser: {e}")
-        return None
-
-# Method 2: Using Selenium Wire for better header control (Alternative)
-def create_driver_with_wire():
-    """Create driver using selenium-wire for more reliable headers"""
-    if not SELENIUM_WIRE_AVAILABLE:
-        return None
-        
-    try:
-        options = {
-            'disable_encoding': True,
-            'request_storage': 'memory',
-            'request_storage_max_size': 100,
-            'ignore_ssl_errors': True,
-        }
-        
-        driver = wire_driver.Chrome(
-            options=chrome_options,
-            seleniumwire_options=options
-        )
-        
-        # Interceptor to add headers to every request
-        def interceptor(request):
-            request.headers['ngrok-skip-browser-warning'] = '1'
-            request.headers['User-Agent'] = 'Mozilla/5.0 (compatible; MyApp/1.0)'
-        
-        driver.request_interceptor = interceptor
-        
-        print("✅ Browser initialized with selenium-wire headers!")
-        return driver
-    except ImportError:
-        print("⚠️ selenium-wire not installed, using standard driver")
-        return None
-    except Exception as e:
-        print(f"❌ Error with selenium-wire: {e}")
-        return None
-
-# Try to create driver with preferred method
-driver = create_driver()
-if driver is None and SELENIUM_WIRE_AVAILABLE:
-    # Fallback to selenium-wire if available
-    driver = create_driver_with_wire()
-
-@app.route('/')
-def index():
-    return jsonify({
-        'status': 'running',
-        'browser_initialized': driver is not None,
-        'message': 'Persistent Selenium Flask Server - Ngrok skip header enabled',
-        'headers': {
-            'ngrok-skip-browser-warning': '1',
-            'user_agent': 'MyApp/1.0'
-        },
-        'solution': 'Headers are automatically injected to skip ngrok interstitial'
-    })
-
-@app.route('/fetch', methods=['GET', 'POST'])
-def fetch():
-    if driver is None:
-        return jsonify({'error': 'Browser not initialized'}), 500
-    
-    url = request.args.get('url') or request.json.get('url')
-    if not url:
-        return jsonify({'error': 'URL parameter required'}), 400
-    
-    try:
-        # Method 1: Re-inject headers before navigation
-        try:
-            driver.execute_cdp_cmd('Network.enable', {})
-            driver.execute_cdp_cmd('Network.setExtraHTTPHeaders', {
-                'headers': {
-                    'ngrok-skip-browser-warning': '1',
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 MyApp/1.0'
-                }
-            })
-        except:
-            pass  # Ignore if CDP fails
-        
-        # Navigate to URL
-        driver.get(url)
-        
-        # Wait a moment for page to load
-        time.sleep(1)
-        
-        # Method 2: If still on interstitial, try to click through
-        current_url = driver.current_url
-        page_source = driver.page_source
-        
-        # Check if we're on ngrok interstitial
-        if 'ngrok-free.app' in current_url and 'ERR_NGROK' in page_source:
-            print("⚠️ Interstitial detected, trying to click through...")
-            
-            try:
-                # Try to find and click the "Visit" button
-                visit_button = WebDriverWait(driver, 5).until(
-                    EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Visit')]"))
-                )
-                visit_button.click()
-                time.sleep(2)
-                
-                # Get the actual page content after clicking
-                page_source = driver.page_source
-                current_url = driver.current_url
-                print("✅ Clicked through interstitial!")
-            except Exception as e:
-                print(f"⚠️ Could not click through automatically: {e}")
-                # Try alternative: click on the link
+            # Debian / Ubuntu
+            if shutil.which("apt-get"):
+                log("   ↳ Trying apt-get install chromium ...")
                 try:
-                    continue_link = driver.find_element(By.CSS_SELECTOR, 'a[href*="continue"]')
-                    continue_link.click()
-                    time.sleep(2)
-                    page_source = driver.page_source
-                    current_url = driver.current_url
-                except:
+                    subprocess.check_call([
+                        "sudo", "apt-get", "update", "-y"
+                    ])
+                    subprocess.check_call([
+                        "sudo", "apt-get", "install", "-y", "chromium"
+                    ])
+                    return True
+                except subprocess.CalledProcessError:
+                    log("   ↳ apt chromium failed, trying chromium-browser...")
+                    try:
+                        subprocess.check_call([
+                            "sudo", "apt-get", "install", "-y",
+                            "chromium-browser"
+                        ])
+                        return True
+                    except subprocess.CalledProcessError:
+                        pass
+
+            # Fedora / RHEL
+            if shutil.which("dnf"):
+                log("   ↳ Trying dnf install chromium ...")
+                try:
+                    subprocess.check_call([
+                        "sudo", "dnf", "install", "-y", "chromium"
+                    ])
+                    return True
+                except subprocess.CalledProcessError:
                     pass
-        
-        # Get page info
-        title = driver.title
-        
-        return jsonify({
-            'url': current_url,
-            'title': title,
-            'content_length': len(page_source),
-            'content': page_source[:1000],  # Truncate for response
-            'status': 'success',
-            'ngrok_skip_used': True,
-            'interstitial_bypassed': 'ERR_NGROK' not in page_source
-        })
-        
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
 
-# Method 3: Special endpoint that handles ngrok URLs specifically
-@app.route('/fetch_ngrok', methods=['POST'])
-def fetch_ngrok():
-    """Specialized endpoint for fetching ngrok URLs with proper bypass"""
-    if driver is None:
-        return jsonify({'error': 'Browser not initialized'}), 500
-    
-    data = request.json
-    target_url = data.get('url')
-    
-    if not target_url:
-        return jsonify({'error': 'URL parameter required'}), 400
-    
+            # Arch
+            if shutil.which("pacman"):
+                log("   ↳ Trying pacman -S chromium ...")
+                try:
+                    subprocess.check_call([
+                        "sudo", "pacman", "-S", "--noconfirm", "chromium"
+                    ])
+                    return True
+                except subprocess.CalledProcessError:
+                    pass
+
+            log("   ⚠️ Could not auto-install Chromium on this Linux distro.")
+            return False
+
+    except Exception as e:
+        log(f"   ⚠️ Installation attempt failed: {e}")
+        return False
+
+
+def ensure_chrome_binary():
+    """Return path to a working Chrome/Chromium binary, installing if needed."""
+    path = find_chrome_binary()
+    if path:
+        log(f"✅ Found Chrome/Chromium at: {path}")
+        return path
+
+    # Try to install it
+    if try_install_chromium():
+        path = find_chrome_binary()
+        if path:
+            log(f"✅ Installed Chrome/Chromium at: {path}")
+            return path
+
+    log("⚠️ Could not locate or install Chrome/Chromium.")
+    log("   Selenium Manager will try to fetch one automatically.")
+    return None
+
+
+# ============================================================
+#  Driver creation
+# ============================================================
+def build_chrome_options(chrome_path):
+    opts = Options()
+    opts.add_argument('--headless=new')   # modern headless mode
+    opts.add_argument('--no-sandbox')
+    opts.add_argument('--disable-dev-shm-usage')
+    opts.add_argument('--disable-gpu')
+    opts.add_argument('--window-size=1920,1080')
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option('useAutomationExtension', False)
+
+    # Only set binary_location if we actually found one.
+    # Otherwise Selenium Manager will handle it.
+    if chrome_path:
+        opts.binary_location = chrome_path
+
+    return opts
+
+
+def create_driver(chrome_path):
+    """Create a Chrome driver with ngrok-skip headers injected."""
     try:
-        # First set up headers
+        opts = build_chrome_options(chrome_path)
+        driver = webdriver.Chrome(options=opts)
+
         driver.execute_cdp_cmd('Network.enable', {})
         driver.execute_cdp_cmd('Network.setExtraHTTPHeaders', {
             'headers': {
                 'ngrok-skip-browser-warning': '1',
-                'User-Agent': 'Mozilla/5.0 (compatible; MyApp/1.0)'
+                'User-Agent': (
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                    'AppleWebKit/537.36 (KHTML, like Gecko) '
+                    'Chrome/120.0.0.0 Safari/537.36 MyApp/1.0'
+                )
             }
         })
-        
-        # Go to the URL
-        driver.get(target_url)
+        log("✅ Browser initialized with skip headers")
+        return driver
+    except Exception as e:
+        log(f"❌ Error initializing browser: {e}")
+        return None
+
+
+# ============================================================
+#  Visit cycle
+# ============================================================
+def visit_site(chrome_path):
+    driver = create_driver(chrome_path)
+    if driver is None:
+        return False
+
+    try:
+        log(f"🌐 Navigating to {TARGET_URL} ...")
+        driver.get(TARGET_URL)
         time.sleep(2)
-        
-        # Handle interstitial if present
+
+        log("=" * 60)
+        log(f"📄 URL       : {driver.current_url}")
+        log(f"🏷️  Title     : {driver.title}")
         page_source = driver.page_source
-        
-        # If we hit the interstitial, click through
-        if 'ERR_NGROK_6024' in page_source:
-            print("🔄 Interstitial detected, clicking through...")
-            
-            # Try multiple ways to bypass
-            bypass_methods = [
-                # Method A: Click "Visit" button
-                lambda: driver.find_element(By.XPATH, "//button[contains(text(), 'Visit')]").click(),
-                # Method B: Click continue link
-                lambda: driver.find_element(By.CSS_SELECTOR, 'a[href*="continue"]').click(),
-                # Method C: Click any button or link with "continue" or "visit"
-                lambda: driver.find_element(By.XPATH, "//*[contains(text(), 'Continue') or contains(text(), 'Visit')]").click()
-            ]
-            
-            for method in bypass_methods:
-                try:
-                    method()
-                    time.sleep(2)
-                    print("✅ Bypassed successfully!")
-                    break
-                except:
-                    continue
-            
-            # Get final page source
-            page_source = driver.page_source
-            current_url = driver.current_url
-        
-        return jsonify({
-            'url': driver.current_url,
-            'title': driver.title,
-            'content_length': len(page_source),
-            'content': page_source[:2000],  # Slightly longer for testing
-            'bypassed': 'ERR_NGROK' not in page_source
-        })
-        
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        log(f"📏 Page size : {len(page_source)} bytes")
 
-@app.route('/install_package', methods=['POST'])
-def install_package():
-    """Endpoint to install additional Python packages on the fly"""
-    data = request.json
-    package = data.get('package')
-    
-    if not package:
-        return jsonify({'error': 'Package name required'}), 400
-    
-    try:
-        print(f"📦 Installing package: {package}")
-        result = subprocess.run([
-            sys.executable,
-            '-m',
-            'pip',
-            'install',
-            package,
-            '--quiet'
-        ], capture_output=True, text=True)
-        
-        if result.returncode == 0:
-            return jsonify({
-                'success': True,
-                'package': package,
-                'message': f'Successfully installed {package}',
-                'output': result.stdout
-            })
-        else:
-            return jsonify({
-                'success': False,
-                'package': package,
-                'error': result.stderr
-            }), 500
-            
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        try:
+            body_text = driver.find_element(By.TAG_NAME, "body").text
+            preview = body_text.strip().replace("\n", " ")[:300]
+            log(f"👀 Preview   : {preview}")
+        except Exception as e:
+            log(f"⚠️ Could not read body text: {e}")
 
-@app.route('/install_requirements', methods=['POST'])
-def install_requirements():
-    """Endpoint to install packages from a requirements.txt file"""
-    # Check if requirements.txt exists
-    if not os.path.exists('requirements.txt'):
-        return jsonify({'error': 'requirements.txt not found'}), 404
-    
-    try:
-        print("📦 Installing from requirements.txt...")
-        result = subprocess.run([
-            sys.executable,
-            '-m',
-            'pip',
-            'install',
-            '-r',
-            'requirements.txt',
-            '--quiet'
-        ], capture_output=True, text=True)
-        
-        if result.returncode == 0:
-            return jsonify({
-                'success': True,
-                'message': 'Successfully installed all requirements',
-                'output': result.stdout
-            })
-        else:
-            return jsonify({
-                'success': False,
-                'error': result.stderr
-            }), 500
-            
+        if 'ERR_NGROK' in page_source:
+            log("⚠️ Ngrok interstitial detected, trying to bypass...")
+            try:
+                btn = WebDriverWait(driver, 5).until(
+                    EC.element_to_be_clickable(
+                        (By.XPATH, "//button[contains(text(), 'Visit')]")
+                    )
+                )
+                btn.click()
+                time.sleep(2)
+                log(f"✅ Bypassed! New title: {driver.title}")
+            except Exception as e:
+                log(f"⚠️ Bypass failed: {e}")
+
+        log(f"✅ Visit successful. Keeping browser open for "
+            f"{VISIT_DURATION_MINUTES} min...")
+        log("=" * 60)
+
+        end_time = time.time() + VISIT_DURATION_MINUTES * 60
+        while time.time() < end_time and running:
+            time.sleep(5)
+
+        return True
+
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        log(f"❌ Error during visit: {e}")
+        return False
+    finally:
+        log("🔄 Closing browser...")
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+
+# ============================================================
+#  Main
+# ============================================================
+def main():
+    log("=" * 60)
+    log("🚀 Selenium Scheduler Started")
+    log(f"   Platform            : {platform.system()} {platform.release()}")
+    log(f"   Target URL          : {TARGET_URL}")
+    log(f"   Visit duration      : {VISIT_DURATION_MINUTES} minutes")
+    log(f"   Wait between visits : {WAIT_BETWEEN_MINUTES} minutes")
+    log("=" * 60)
+
+    # Resolve / install Chrome once at startup
+    chrome_path = ensure_chrome_binary()
+
+    cycle = 0
+    while running:
+        cycle += 1
+        log(f"\n===== CYCLE #{cycle} =====")
+        visit_site(chrome_path)
+
+        if not running:
+            break
+
+        log(f"😴 Sleeping for {WAIT_BETWEEN_MINUTES} minutes before next visit...")
+        end_wait = time.time() + WAIT_BETWEEN_MINUTES * 60
+        while time.time() < end_wait and running:
+            time.sleep(5)
+
+    log("👋 Scheduler stopped.")
+
 
 if __name__ == '__main__':
-    print("=" * 60)
-    print("🌐 Persistent Selenium Flask Server")
-    print(f"Headless mode: True")
-    print(f"Persistent session: True (browser stays open)")
-    print(f"Ngrok skip header: Enabled (automatically bypasses interstitial)")
-    print("Server running at: http://127.0.0.1:5000")
-    print("\nTo use with ngrok:")
-    print("  1. Run: ngrok http 5000")
-    print("  2. Access your app via the ngrok URL")
-    print("  3. All requests will automatically skip the interstitial")
-    print("\nTest endpoints:")
-    print("  POST /fetch_ngrok - For ngrok URLs specifically")
-    print("  POST /fetch - For any URL")
-    print("  POST /install_package - Install additional packages on the fly")
-    print("  POST /install_requirements - Install from requirements.txt")
-    print("=" * 60)
-    
-    try:
-        app.run(host='0.0.0.0', port=5730, debug=False)
-    finally:
-        if driver:
-            driver.quit()
-            print("🔄 Browser closed.")
+    main()
