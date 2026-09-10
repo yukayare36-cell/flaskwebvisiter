@@ -339,7 +339,19 @@ if st.session_state.scheduler_enabled:
 
 # ---------- Notes ----------
 with st.expander("ℹ️ How to make this work on Streamlit Cloud"):
-    st.markdown("""
-### Required files in your repo
-
-**`packages.txt`** (system packages, installed via apt):
+    st.markdown("**Required files in your repo:**")
+    st.code(
+        "packages.txt:\nchromium\nchromium-driver\n\n"
+        "requirements.txt:\nstreamlit\nselenium",
+        language="text",
+    )
+    st.markdown("**Important limitations:**")
+    st.markdown(
+        "- The browser tab must stay open. Streamlit Community Cloud "
+        "sleeps after ~15 min of no activity.\n"
+        "- Each `st.rerun()` restarts the script from the top. State "
+        "lives only in `st.session_state`.\n"
+        "- `time.sleep(5)` blocks the UI during visits."
+    )
+    st.markdown("**Need 24/7 without an open tab?** Use GitHub Actions, "
+                "Render worker, Railway worker, or a VPS instead.")
