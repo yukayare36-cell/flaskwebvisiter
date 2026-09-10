@@ -25,7 +25,7 @@ LINKS_JSON = "links.json"
 FORMATTED_URLS_FILE = "formatted_urls.txt"     # comma-separated fallback
 PAGE_LOAD_TIMEOUT_SECONDS = 60             # per-link timeout
 PAUSE_BETWEEN_LINKS_SECONDS = 1            # small breather between links
-RESTART_PAUSE_SECONDS = 60                 # pause between full passes
+RESTART_PAUSE_SECONDS = 1                # pause between full passes
 MAX_CONSECUTIVE_ERRORS = 5                 # restart browser after N errors
 # =======================================
 
