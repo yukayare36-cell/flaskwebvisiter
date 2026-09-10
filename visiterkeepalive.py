@@ -12,12 +12,14 @@ import datetime
 import os
 import platform
 import shutil
-import threading
 
 # ============ CONFIGURATION ============
 TARGET_URL = "https://userwho.loophole.site"
 VISIT_DURATION_MINUTES = 5
 WAIT_BETWEEN_MINUTES = 10
+PAGE_LOAD_TIMEOUT_SECONDS = 30     # fail fast instead of hanging
+MAX_VISIT_RETRIES = 3              # retries within one cycle before giving up
+RETRY_DELAY_SECONDS = 20           # wait between retries
 # =======================================
 
 st.set_page_config(page_title="Selenium Scheduler", layout="wide")
@@ -30,8 +32,7 @@ def log(msg):
     print(line)
     if "log_lines" in st.session_state:
         st.session_state.log_lines.append(line)
-        # Keep only last 200 lines
-        st.session_state.log_lines = st.session_state.log_lines[-200:]
+        st.session_state.log_lines = st.session_state.log_lines[-300:]
 
 
 # ---------- Package installation ----------
@@ -49,8 +50,7 @@ def pip_install(package, quiet=True):
 
 @st.cache_resource(show_spinner=False)
 def ensure_python_deps():
-    required = ['selenium']
-    for pkg in required:
+    for pkg in ['selenium']:
         try:
             importlib.import_module(pkg)
         except ImportError:
@@ -61,8 +61,6 @@ def ensure_python_deps():
 # ---------- Chrome detection ----------
 def find_chrome_binary():
     system = platform.system()
-    candidates = []
-
     if system == "Windows":
         candidates = [
             r"C:\Program Files\Google\Chrome\Application\chrome.exe",
@@ -98,40 +96,9 @@ def find_chrome_binary():
     return None
 
 
-def try_install_chromium_linux():
-    """On Streamlit Cloud (Debian), try apt-get — needs sudo, often fails."""
-    if platform.system() != "Linux":
-        return False
-    if not shutil.which("apt-get"):
-        return False
-    try:
-        subprocess.check_call([
-            "sudo", "apt-get", "update", "-y"
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.check_call([
-            "sudo", "apt-get", "install", "-y",
-            "chromium", "chromium-driver"
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return True
-    except Exception:
-        try:
-            subprocess.check_call([
-                "sudo", "apt-get", "install", "-y",
-                "chromium-browser", "chromium-chromedriver"
-            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return True
-        except Exception:
-            return False
-
-
 @st.cache_resource(show_spinner=False)
 def ensure_chrome_binary():
-    path = find_chrome_binary()
-    if path:
-        return path
-    if try_install_chromium_linux():
-        return find_chrome_binary()
-    return None
+    return find_chrome_binary()
 
 
 # ---------- Driver ----------
@@ -158,6 +125,7 @@ def create_driver(chrome_path):
     try:
         opts = build_chrome_options(chrome_path)
         driver = webdriver.Chrome(options=opts)
+        driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT_SECONDS)
         driver.execute_cdp_cmd('Network.enable', {})
         driver.execute_cdp_cmd('Network.setExtraHTTPHeaders', {
             'headers': {
@@ -175,11 +143,12 @@ def create_driver(chrome_path):
         return None
 
 
-# ---------- One visit ----------
-def visit_site(chrome_path):
+# ---------- One visit (with retries) ----------
+def _single_visit_attempt(chrome_path):
+    """One attempt. Returns (success, error_message)."""
     driver = create_driver(chrome_path)
     if driver is None:
-        return False
+        return False, "could not create driver"
 
     try:
         log(f"🌐 Navigating to {TARGET_URL} ...")
@@ -216,34 +185,58 @@ def visit_site(chrome_path):
         log(f"✅ Visit successful. Keeping browser open for "
             f"{VISIT_DURATION_MINUTES} min...")
 
-        # Short sleep so we don't freeze Streamlit too badly
         end_time = time.time() + VISIT_DURATION_MINUTES * 60
         while time.time() < end_time:
             time.sleep(5)
-            # Let Streamlit know we're still alive (no rerun, just yield)
             if not st.session_state.get("scheduler_enabled", True):
                 break
 
-        return True
+        return True, None
 
     except Exception as e:
-        log(f"❌ Error during visit: {e}")
-        return False
+        return False, str(e)
     finally:
-        log("🔄 Closing browser...")
         try:
             driver.quit()
         except Exception:
             pass
 
 
-# ---------- Session state init ----------
+def visit_site(chrome_path):
+    """Visit with retries. Never raises."""
+    for attempt in range(1, MAX_VISIT_RETRIES + 1):
+        if not st.session_state.get("scheduler_enabled", True):
+            log("⏹ Scheduler disabled mid-visit — aborting.")
+            return False
+
+        log(f"🔄 Attempt {attempt}/{MAX_VISIT_RETRIES}")
+        ok, err = _single_visit_attempt(chrome_path)
+        if ok:
+            log("🔄 Closing browser...")
+            return True
+
+        log(f"❌ Error during visit: {err}")
+        log("🔄 Closing browser...")
+
+        if attempt < MAX_VISIT_RETRIES:
+            log(f"⏸ Retrying in {RETRY_DELAY_SECONDS}s ...")
+            for _ in range(RETRY_DELAY_SECONDS):
+                if not st.session_state.get("scheduler_enabled", True):
+                    return False
+                time.sleep(1)
+
+    log(f"❌ All {MAX_VISIT_RETRIES} attempts failed. Will retry on next cycle.")
+    return False
+
+
+# ---------- Session state ----------
 def init_state():
     defaults = {
         "log_lines": [],
-        "scheduler_enabled": False,
+        "scheduler_enabled": True,   # AUTO-START
         "next_run_at": 0.0,
         "cycle_count": 0,
+        "last_state_load": time.time(),
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -255,28 +248,36 @@ init_state()
 
 # ---------- Sidebar ----------
 with st.sidebar:
-    st.header("⚙️ Scheduler")
+    st.header("⚙️ Scheduler (auto-run)")
 
     st.write(f"**Target URL:** `{TARGET_URL}`")
     st.write(f"**Visit duration:** {VISIT_DURATION_MINUTES} min")
     st.write(f"**Wait between:** {WAIT_BETWEEN_MINUTES} min")
-
-    if st.button("▶️ Start scheduler"):
-        st.session_state.scheduler_enabled = True
-        st.session_state.next_run_at = 0.0
-        log("▶️ Scheduler enabled")
+    st.write(f"**Max retries / cycle:** {MAX_VISIT_RETRIES}")
 
     if st.button("⏹ Stop scheduler"):
         st.session_state.scheduler_enabled = False
         log("⏹ Scheduler disabled")
 
+    if st.button("▶️ Resume scheduler"):
+        st.session_state.scheduler_enabled = True
+        if st.session_state.next_run_at == 0.0:
+            st.session_state.next_run_at = time.time()
+        log("▶️ Scheduler enabled")
+
     if st.button("🧹 Clear logs"):
         st.session_state.log_lines = []
 
+    if st.button("🔄 Force visit now"):
+        st.session_state.next_run_at = 0.0
+        log("🔄 Forcing next cycle now")
+        st.rerun()
+
     st.divider()
     st.caption(
-        "⚠️ On Streamlit Community Cloud the app sleeps when the tab "
-        "is closed. Keep this page open for the scheduler to keep running."
+        "Runs automatically. Reloading the page does NOT stop the "
+        "schedule — state is kept in the session. Errors are logged "
+        "and retried automatically."
     )
 
 
@@ -287,16 +288,18 @@ chrome_path = ensure_chrome_binary()
 if chrome_path:
     st.success(f"✅ Chrome found: `{chrome_path}`")
 else:
-    st.warning(
-        "⚠️ Chrome/Chromium not found. On Streamlit Cloud, add a "
-        "`packages.txt` file with:\n\n```\nchromium\nchromium-driver\n```\n\n"
-        "and a `requirements.txt` with `selenium`."
+    st.error(
+        "❌ Chrome/Chromium not found. Add a `packages.txt` with:\n"
+        "```\nchromium\nchromium-driver\n```"
     )
 
 status_col, cycle_col, next_col = st.columns(3)
-status_col.metric("Status",
-                  "🟢 Running" if st.session_state.scheduler_enabled else "🔴 Stopped")
+status_col.metric(
+    "Status",
+    "🟢 Running" if st.session_state.scheduler_enabled else "🔴 Stopped"
+)
 cycle_col.metric("Cycles completed", st.session_state.cycle_count)
+
 if st.session_state.scheduler_enabled and st.session_state.next_run_at:
     remaining = max(0, int(st.session_state.next_run_at - time.time()))
     next_col.metric("Next run in", f"{remaining} s")
@@ -305,53 +308,63 @@ else:
 
 st.subheader("📜 Logs")
 log_box = st.empty()
-log_box.code("\n".join(st.session_state.log_lines[-100:]) or "(no logs yet)",
-             language="log")
+log_box.code(
+    "\n".join(st.session_state.log_lines[-150:]) or "(no logs yet)",
+    language="log"
+)
 
 
-# ---------- Scheduler tick ----------
-# Runs on every rerun. If the timer has elapsed, does one visit and
-# schedules the next. Uses st.rerun() with a short sleep to keep UI alive.
-
+# ---------- Scheduler tick (auto-run, self-healing) ----------
 if st.session_state.scheduler_enabled:
     now = time.time()
 
     if now >= st.session_state.next_run_at:
-        # Time to visit
         st.session_state.cycle_count += 1
         log(f"\n===== CYCLE #{st.session_state.cycle_count} =====")
 
-        with st.spinner("Visiting site (this can take up to "
-                        f"{VISIT_DURATION_MINUTES} min)..."):
-            visit_site(chrome_path)
+        with st.spinner("Visiting site..."):
+            try:
+                visit_site(chrome_path)
+            except Exception as e:
+                # Belt-and-braces: should never happen because visit_site
+                # catches everything, but if it does, keep the loop alive.
+                log(f"💥 Unexpected scheduler error (recovered): {e}")
 
-        # Schedule next run
+        # Schedule next run no matter what happened
         st.session_state.next_run_at = time.time() + WAIT_BETWEEN_MINUTES * 60
         log(f"😴 Next visit scheduled in {WAIT_BETWEEN_MINUTES} min")
 
-        # Refresh UI so the browser stays responsive
         st.rerun()
     else:
-        # Not time yet — sleep briefly then rerun
         time.sleep(5)
         st.rerun()
 
 
 # ---------- Notes ----------
-with st.expander("ℹ️ How to make this work on Streamlit Cloud"):
-    st.markdown("**Required files in your repo:**")
+with st.expander("ℹ️ How this works"):
+    st.markdown("**Behavior**")
+    st.markdown(
+        "- **Auto-start** — no button needed; the loop begins on load.\n"
+        "- **Reload-safe** — refreshing the page does not stop or reset "
+        "the schedule (state lives in the Streamlit session).\n"
+        "- **Auto-retry** — a failed visit is retried up to "
+        f"`{MAX_VISIT_RETRIES}` times with a `{RETRY_DELAY_SECONDS}s` "
+        "delay, then the loop moves on to the next cycle.\n"
+        "- **Fast-fail** — page load has a "
+        f"`{PAGE_LOAD_TIMEOUT_SECONDS}s` timeout so a dead host "
+        "(like the `ERR_CONNECTION_CLOSED` you saw) won't hang the app."
+    )
+    st.markdown("**Required files**")
     st.code(
         "packages.txt:\nchromium\nchromium-driver\n\n"
         "requirements.txt:\nstreamlit\nselenium",
         language="text",
     )
-    st.markdown("**Important limitations:**")
+    st.markdown("**Limitations on Streamlit Cloud**")
     st.markdown(
-        "- The browser tab must stay open. Streamlit Community Cloud "
-        "sleeps after ~15 min of no activity.\n"
-        "- Each `st.rerun()` restarts the script from the top. State "
-        "lives only in `st.session_state`.\n"
-        "- `time.sleep(5)` blocks the UI during visits."
+        "- Tab must stay open — the app hibernates after ~15 min idle.\n"
+        "- Reload ≠ session reset *only if* the app hasn't hibernated. "
+        "If it hibernates, `session_state` resets and the cycle counter "
+        "starts over.\n"
+        "- For true 24/7 no-tab running, use GitHub Actions / a worker."
     )
-    st.markdown("**Need 24/7 without an open tab?** Use GitHub Actions, "
-                "Render worker, Railway worker, or a VPS instead.")
