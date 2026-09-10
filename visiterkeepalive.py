@@ -4,25 +4,45 @@ import sys
 import os
 import time
 import datetime
+import glob
 
 # ============ CONFIGURATION ============
-WORKER_SCRIPT = "visitor_worker.py"
-LOG_FILE = "visitor.log"
-PID_FILE = "visitor.pid"
+WORKER_PATTERN = "visitor_worker*.py"    # visitor_worker.py, visitor_worker1.py, ...
+LOG_DIR = "logs"                          # per-worker logs live here
+PID_DIR = "pids"                          # per-worker pid files live here
 # =======================================
 
 st.set_page_config(page_title="Visitor Scheduler", layout="wide")
 
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(PID_DIR, exist_ok=True)
+
+
+# ---------- Discovery ----------
+def discover_workers():
+    """Find all worker scripts matching the pattern, sorted."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    files = sorted(glob.glob(os.path.join(here, WORKER_PATTERN)))
+    return [os.path.basename(f) for f in files]
+
+
+def log_path(worker):
+    return os.path.join(LOG_DIR, f"{os.path.splitext(worker)[0]}.log")
+
+
+def pid_path(worker):
+    return os.path.join(PID_DIR, f"{os.path.splitext(worker)[0]}.pid")
+
 
 # ---------- Worker management ----------
-def is_worker_running():
-    """Check if the background worker process is alive."""
-    if not os.path.exists(PID_FILE):
+def is_worker_running(worker):
+    """Check if a specific worker process is alive."""
+    pfile = pid_path(worker)
+    if not os.path.exists(pfile):
         return False
     try:
-        with open(PID_FILE) as f:
+        with open(pfile) as f:
             pid = int(f.read().strip())
-        # Check if process exists (Linux/macOS/Windows)
         if os.name == "nt":
             out = subprocess.run(
                 ["tasklist", "/FI", f"PID eq {pid}"],
@@ -36,24 +56,21 @@ def is_worker_running():
         return False
 
 
-def start_worker():
-    """Spawn the worker as a detached background process."""
-    if is_worker_running():
-        return False, "Worker already running"
+def start_worker(worker):
+    """Spawn a specific worker as a detached background process."""
+    if is_worker_running(worker):
+        return False, f"{worker} already running"
 
-    # Use the same Python interpreter running Streamlit
     kwargs = {}
     if os.name == "nt":
-        # DETACHED_PROCESS on Windows
-        kwargs["creationflags"] = 0x00000008 | 0x00000200
+        kwargs["creationflags"] = 0x00000008 | 0x00000200  # DETACHED | NEW_GROUP
     else:
         kwargs["start_new_session"] = True
 
-    # Redirect worker output to the log file
-    log_fh = open(LOG_FILE, "a", encoding="utf-8")
+    log_fh = open(log_path(worker), "a", encoding="utf-8")
 
     proc = subprocess.Popen(
-        [sys.executable, WORKER_SCRIPT],
+        [sys.executable, worker],
         stdout=log_fh,
         stderr=log_fh,
         stdin=subprocess.DEVNULL,
@@ -61,18 +78,19 @@ def start_worker():
         **kwargs,
     )
 
-    with open(PID_FILE, "w") as f:
+    with open(pid_path(worker), "w") as f:
         f.write(str(proc.pid))
 
-    return True, f"Worker started (PID {proc.pid})"
+    return True, f"{worker} started (PID {proc.pid})"
 
 
-def stop_worker():
-    """Kill the worker if it's running."""
-    if not os.path.exists(PID_FILE):
-        return False, "No worker to stop"
+def stop_worker(worker):
+    """Kill a specific worker."""
+    pfile = pid_path(worker)
+    if not os.path.exists(pfile):
+        return False, f"{worker} not running"
     try:
-        with open(PID_FILE) as f:
+        with open(pfile) as f:
             pid = int(f.read().strip())
 
         if os.name == "nt":
@@ -82,81 +100,123 @@ def stop_worker():
             os.kill(pid, 15)  # SIGTERM
 
         try:
-            os.remove(PID_FILE)
+            os.remove(pfile)
         except OSError:
             pass
-        return True, f"Stopped worker (PID {pid})"
+        return True, f"Stopped {worker} (PID {pid})"
     except (ValueError, ProcessLookupError) as e:
         try:
-            os.remove(PID_FILE)
+            os.remove(pfile)
         except OSError:
             pass
-        return False, f"Could not stop worker: {e}"
+        return False, f"Could not stop {worker}: {e}"
 
 
-def read_log_tail(n=200):
-    """Read the last N lines of the log file."""
-    if not os.path.exists(LOG_FILE):
+def read_log_tail(worker, n=150):
+    """Read the last N lines of a worker's log."""
+    p = log_path(worker)
+    if not os.path.exists(p):
         return "(no logs yet)"
     try:
-        with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
             lines = f.readlines()
         return "".join(lines[-n:]) or "(log is empty)"
     except Exception as e:
         return f"(could not read log: {e})"
 
 
-# ---------- Auto-start on first page load ----------
+# ---------- Auto-start all workers on first page load ----------
+workers = discover_workers()
+
 if "auto_started" not in st.session_state:
     st.session_state.auto_started = True
-    if not is_worker_running():
-        ok, msg = start_worker()
-        print(f"[auto-start] {ok} - {msg}")
+    started = []
+    for w in workers:
+        if not is_worker_running(w):
+            ok, msg = start_worker(w)
+            if ok:
+                started.append(msg)
+    print(f"[auto-start] started: {started}")
 
 
 # ---------- UI ----------
 st.title("🌐 Selenium Visitor Scheduler")
-
 st.caption(
-    "The actual work runs in a background process — closing this tab "
-    "does **not** stop it. Streamlit's healthcheck is satisfied by "
-    "this page, so the container stays alive."
+    "Each `visitor_worker*.py` file runs as its own detached background "
+    "process. Closing this tab does **not** stop them."
 )
 
-running = is_worker_running()
+# Discovery summary
+st.subheader(f"🧭 Discovered workers ({len(workers)})")
+if not workers:
+    st.warning(
+        f"No files matching `{WORKER_PATTERN}` found. Add one and reload."
+    )
+else:
+    st.code("\n".join(workers), language="text")
 
-col1, col2, col3 = st.columns(3)
-col1.metric("Worker", "🟢 Running" if running else "🔴 Stopped")
-col2.metric("Healthcheck", "✅ OK")
-col3.metric("Server time", datetime.datetime.now().strftime("%H:%M:%S"))
+st.divider()
 
-# Buttons
-b1, b2, b3 = st.columns(3)
-with b1:
-    if st.button("▶️ Start worker"):
-        ok, msg = start_worker()
-        st.success(msg) if ok else st.warning(msg)
+# ---- Per-worker cards ----
+for w in workers:
+    running = is_worker_running(w)
+    header = f"{'🟢' if running else '🔴'}  `{w}`"
+
+    with st.expander(header, expanded=True):
+        col1, col2 = st.columns([2, 2])
+
+        with col1:
+            st.metric("Status", "Running" if running else "Stopped")
+            if running:
+                try:
+                    with open(pid_path(w)) as f:
+                        st.caption(f"PID: {f.read().strip()}")
+                except Exception:
+                    pass
+
+        with col2:
+            bc1, bc2, bc3 = st.columns(3)
+            with bc1:
+                if st.button("▶️", key=f"start_{w}"):
+                    ok, msg = start_worker(w)
+                    st.toast(msg)
+                    st.rerun()
+            with bc2:
+                if st.button("⏹", key=f"stop_{w}"):
+                    ok, msg = stop_worker(w)
+                    st.toast(msg)
+                    st.rerun()
+            with bc3:
+                if st.button("🧹", key=f"clear_{w}"):
+                    try:
+                        open(log_path(w), "w").close()
+                    except Exception:
+                        pass
+                    st.rerun()
+
+        st.code(read_log_tail(w, 100) or "(no logs yet)", language="log")
+
+
+# ---- Global controls ----
+st.divider()
+st.subheader("⚙️ Global controls")
+g1, g2 = st.columns(2)
+with g1:
+    if st.button("▶️ Start all workers"):
+        for w in workers:
+            if not is_worker_running(w):
+                start_worker(w)
+        st.toast("Started all workers")
         st.rerun()
-with b2:
-    if st.button("⏹ Stop worker"):
-        ok, msg = stop_worker()
-        st.success(msg) if ok else st.warning(msg)
-        st.rerun()
-with b3:
-    if st.button("🧹 Clear log"):
-        try:
-            open(LOG_FILE, "w").close()
-        except Exception:
-            pass
+with g2:
+    if st.button("⏹ Stop all workers"):
+        for w in workers:
+            stop_worker(w)
+        st.toast("Stopped all workers")
         st.rerun()
 
-# ---- Log display ----
-st.subheader("📜 Live log (`visitor.log`)")
-log_text = read_log_tail(200)
-st.code(log_text, language="log")
 
-# ---- Manual auto-refresh via JS (works without extra package) ----
-# Rerun the page every 5 seconds so the log updates live
+# ---- Auto-refresh the page every 5s ----
 st.markdown(
     """
     <script>
@@ -170,5 +230,5 @@ st.markdown(
 
 st.caption(
     "Page auto-reloads every 5s. Reloading or closing the tab does not "
-    "affect the background worker."
+    "affect the background workers."
 )
