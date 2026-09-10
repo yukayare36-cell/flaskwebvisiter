@@ -1,3 +1,4 @@
+import streamlit as st
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
@@ -8,10 +9,10 @@ import subprocess
 import sys
 import importlib
 import datetime
-import signal
 import os
 import platform
 import shutil
+import threading
 
 # ============ CONFIGURATION ============
 TARGET_URL = "https://example.com"
@@ -19,25 +20,21 @@ VISIT_DURATION_MINUTES = 5
 WAIT_BETWEEN_MINUTES = 10
 # =======================================
 
-running = True
-
-def signal_handler(sig, frame):
-    global running
-    print("\n🛑 Shutdown signal received. Exiting after current cycle...")
-    running = False
-
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
+st.set_page_config(page_title="Selenium Scheduler", layout="wide")
 
 
+# ---------- Logging ----------
 def log(msg):
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] {msg}")
+    line = f"[{ts}] {msg}"
+    print(line)
+    if "log_lines" in st.session_state:
+        st.session_state.log_lines.append(line)
+        # Keep only last 200 lines
+        st.session_state.log_lines = st.session_state.log_lines[-200:]
 
 
-# ============================================================
-#  Package installation
-# ============================================================
+# ---------- Package installation ----------
 def pip_install(package, quiet=True):
     cmd = [sys.executable, '-m', 'pip', 'install', package]
     if quiet:
@@ -46,36 +43,23 @@ def pip_install(package, quiet=True):
         subprocess.check_call(cmd)
         return True
     except subprocess.CalledProcessError as e:
-        log(f"⚠️ pip install {package} failed: {e}")
+        print(f"⚠️ pip install {package} failed: {e}")
         return False
 
 
+@st.cache_resource(show_spinner=False)
 def ensure_python_deps():
-    log("🔍 Checking required Python packages...")
-    required = {
-        'selenium': 'selenium',
-        'webdriver_manager': 'webdriver-manager',  # optional fallback
-    }
-    for module, pkg in required.items():
+    required = ['selenium']
+    for pkg in required:
         try:
-            importlib.import_module(module)
-            log(f"✅ {pkg} is already installed")
+            importlib.import_module(pkg)
         except ImportError:
-            log(f"📦 Installing {pkg}...")
-            if pip_install(pkg):
-                log(f"✅ Installed {pkg}")
-            else:
-                log(f"⚠️ Could not install {pkg} — continuing anyway")
+            pip_install(pkg)
+    return True
 
 
-ensure_python_deps()
-
-
-# ============================================================
-#  Chrome / Chromium detection & installation
-# ============================================================
+# ---------- Chrome detection ----------
 def find_chrome_binary():
-    """Return path to Chrome/Chromium binary if it exists, else None."""
     system = platform.system()
     candidates = []
 
@@ -86,20 +70,13 @@ def find_chrome_binary():
             os.path.expanduser(
                 r"~\AppData\Local\Google\Chrome\Application\chrome.exe"
             ),
-            r"C:\Program Files\Chromium\Application\chrome.exe",
-            r"C:\Program Files (x86)\Chromium\Application\chrome.exe",
-            os.path.expanduser(
-                r"~\AppData\Local\Chromium\Application\chrome.exe"
-            ),
         ]
     elif system == "Darwin":
         candidates = [
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
             "/Applications/Chromium.app/Contents/MacOS/Chromium",
-            "/Applications/Google Chrome Canary.app/Contents/MacOS/"
-            "Google Chrome Canary",
         ]
-    else:  # Linux
+    else:
         candidates = [
             "/usr/bin/chromium",
             "/usr/bin/chromium-browser",
@@ -108,12 +85,10 @@ def find_chrome_binary():
             "/snap/bin/chromium",
         ]
 
-    # First, check the common paths
     for path in candidates:
         if os.path.exists(path):
             return path
 
-    # Then, try PATH lookup
     for name in ("chromium", "chromium-browser", "google-chrome",
                  "google-chrome-stable", "chrome"):
         found = shutil.which(name)
@@ -123,148 +98,66 @@ def find_chrome_binary():
     return None
 
 
-def try_install_chromium():
-    """Attempt to install Chromium via the OS package manager."""
-    system = platform.system()
-    log("📦 Chrome/Chromium not found — attempting installation...")
-
-    try:
-        if system == "Windows":
-            # Try winget first, then choco
-            if shutil.which("winget"):
-                log("   ↳ Trying winget install Google.Chrome ...")
-                subprocess.check_call([
-                    "winget", "install", "--id", "Google.Chrome",
-                    "-e", "--silent",
-                    "--accept-package-agreements",
-                    "--accept-source-agreements",
-                ])
-                return True
-            if shutil.which("choco"):
-                log("   ↳ Trying choco install googlechrome ...")
-                subprocess.check_call([
-                    "choco", "install", "googlechrome", "-y"
-                ])
-                return True
-            log("   ⚠️ Neither winget nor choco available on this Windows box.")
-            log("   👉 Please install Chrome manually: "
-                "https://www.google.com/chrome/")
-            return False
-
-        elif system == "Darwin":
-            if shutil.which("brew"):
-                log("   ↳ Trying brew install --cask chromium ...")
-                subprocess.check_call([
-                    "brew", "install", "--cask", "chromium"
-                ])
-                return True
-            log("   ⚠️ Homebrew not found. "
-                "Install Chrome manually: https://www.google.com/chrome/")
-            return False
-
-        else:  # Linux
-            if os.geteuid() != 0:
-                log("   ⚠️ Not running as root — Linux package install "
-                    "may fail. Trying sudo-less methods first...")
-
-            # Debian / Ubuntu
-            if shutil.which("apt-get"):
-                log("   ↳ Trying apt-get install chromium ...")
-                try:
-                    subprocess.check_call([
-                        "sudo", "apt-get", "update", "-y"
-                    ])
-                    subprocess.check_call([
-                        "sudo", "apt-get", "install", "-y", "chromium"
-                    ])
-                    return True
-                except subprocess.CalledProcessError:
-                    log("   ↳ apt chromium failed, trying chromium-browser...")
-                    try:
-                        subprocess.check_call([
-                            "sudo", "apt-get", "install", "-y",
-                            "chromium-browser"
-                        ])
-                        return True
-                    except subprocess.CalledProcessError:
-                        pass
-
-            # Fedora / RHEL
-            if shutil.which("dnf"):
-                log("   ↳ Trying dnf install chromium ...")
-                try:
-                    subprocess.check_call([
-                        "sudo", "dnf", "install", "-y", "chromium"
-                    ])
-                    return True
-                except subprocess.CalledProcessError:
-                    pass
-
-            # Arch
-            if shutil.which("pacman"):
-                log("   ↳ Trying pacman -S chromium ...")
-                try:
-                    subprocess.check_call([
-                        "sudo", "pacman", "-S", "--noconfirm", "chromium"
-                    ])
-                    return True
-                except subprocess.CalledProcessError:
-                    pass
-
-            log("   ⚠️ Could not auto-install Chromium on this Linux distro.")
-            return False
-
-    except Exception as e:
-        log(f"   ⚠️ Installation attempt failed: {e}")
+def try_install_chromium_linux():
+    """On Streamlit Cloud (Debian), try apt-get — needs sudo, often fails."""
+    if platform.system() != "Linux":
         return False
+    if not shutil.which("apt-get"):
+        return False
+    try:
+        subprocess.check_call([
+            "sudo", "apt-get", "update", "-y"
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.check_call([
+            "sudo", "apt-get", "install", "-y",
+            "chromium", "chromium-driver"
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        try:
+            subprocess.check_call([
+                "sudo", "apt-get", "install", "-y",
+                "chromium-browser", "chromium-chromedriver"
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except Exception:
+            return False
 
 
+@st.cache_resource(show_spinner=False)
 def ensure_chrome_binary():
-    """Return path to a working Chrome/Chromium binary, installing if needed."""
     path = find_chrome_binary()
     if path:
-        log(f"✅ Found Chrome/Chromium at: {path}")
         return path
-
-    # Try to install it
-    if try_install_chromium():
-        path = find_chrome_binary()
-        if path:
-            log(f"✅ Installed Chrome/Chromium at: {path}")
-            return path
-
-    log("⚠️ Could not locate or install Chrome/Chromium.")
-    log("   Selenium Manager will try to fetch one automatically.")
+    if try_install_chromium_linux():
+        return find_chrome_binary()
     return None
 
 
-# ============================================================
-#  Driver creation
-# ============================================================
+# ---------- Driver ----------
 def build_chrome_options(chrome_path):
     opts = Options()
-    opts.add_argument('--headless=new')   # modern headless mode
+    opts.add_argument('--headless=new')
     opts.add_argument('--no-sandbox')
     opts.add_argument('--disable-dev-shm-usage')
     opts.add_argument('--disable-gpu')
     opts.add_argument('--window-size=1920,1080')
+    opts.add_argument('--log-level=3')
+    opts.add_argument('--disable-logging')
+    opts.add_argument('--disable-background-networking')
+    opts.add_argument('--disable-sync')
+    opts.add_argument('--no-first-run')
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option('useAutomationExtension', False)
-
-    # Only set binary_location if we actually found one.
-    # Otherwise Selenium Manager will handle it.
     if chrome_path:
         opts.binary_location = chrome_path
-
     return opts
 
 
 def create_driver(chrome_path):
-    """Create a Chrome driver with ngrok-skip headers injected."""
     try:
         opts = build_chrome_options(chrome_path)
         driver = webdriver.Chrome(options=opts)
-
         driver.execute_cdp_cmd('Network.enable', {})
         driver.execute_cdp_cmd('Network.setExtraHTTPHeaders', {
             'headers': {
@@ -276,16 +169,13 @@ def create_driver(chrome_path):
                 )
             }
         })
-        log("✅ Browser initialized with skip headers")
         return driver
     except Exception as e:
         log(f"❌ Error initializing browser: {e}")
         return None
 
 
-# ============================================================
-#  Visit cycle
-# ============================================================
+# ---------- One visit ----------
 def visit_site(chrome_path):
     driver = create_driver(chrome_path)
     if driver is None:
@@ -325,11 +215,14 @@ def visit_site(chrome_path):
 
         log(f"✅ Visit successful. Keeping browser open for "
             f"{VISIT_DURATION_MINUTES} min...")
-        log("=" * 60)
 
+        # Short sleep so we don't freeze Streamlit too badly
         end_time = time.time() + VISIT_DURATION_MINUTES * 60
-        while time.time() < end_time and running:
+        while time.time() < end_time:
             time.sleep(5)
+            # Let Streamlit know we're still alive (no rerun, just yield)
+            if not st.session_state.get("scheduler_enabled", True):
+                break
 
         return True
 
@@ -344,37 +237,109 @@ def visit_site(chrome_path):
             pass
 
 
-# ============================================================
-#  Main
-# ============================================================
-def main():
-    log("=" * 60)
-    log("🚀 Selenium Scheduler Started")
-    log(f"   Platform            : {platform.system()} {platform.release()}")
-    log(f"   Target URL          : {TARGET_URL}")
-    log(f"   Visit duration      : {VISIT_DURATION_MINUTES} minutes")
-    log(f"   Wait between visits : {WAIT_BETWEEN_MINUTES} minutes")
-    log("=" * 60)
-
-    # Resolve / install Chrome once at startup
-    chrome_path = ensure_chrome_binary()
-
-    cycle = 0
-    while running:
-        cycle += 1
-        log(f"\n===== CYCLE #{cycle} =====")
-        visit_site(chrome_path)
-
-        if not running:
-            break
-
-        log(f"😴 Sleeping for {WAIT_BETWEEN_MINUTES} minutes before next visit...")
-        end_wait = time.time() + WAIT_BETWEEN_MINUTES * 60
-        while time.time() < end_wait and running:
-            time.sleep(5)
-
-    log("👋 Scheduler stopped.")
+# ---------- Session state init ----------
+def init_state():
+    defaults = {
+        "log_lines": [],
+        "scheduler_enabled": False,
+        "next_run_at": 0.0,
+        "cycle_count": 0,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
 
-if __name__ == '__main__':
-    main()
+init_state()
+
+
+# ---------- Sidebar ----------
+with st.sidebar:
+    st.header("⚙️ Scheduler")
+
+    st.write(f"**Target URL:** `{TARGET_URL}`")
+    st.write(f"**Visit duration:** {VISIT_DURATION_MINUTES} min")
+    st.write(f"**Wait between:** {WAIT_BETWEEN_MINUTES} min")
+
+    if st.button("▶️ Start scheduler"):
+        st.session_state.scheduler_enabled = True
+        st.session_state.next_run_at = 0.0
+        log("▶️ Scheduler enabled")
+
+    if st.button("⏹ Stop scheduler"):
+        st.session_state.scheduler_enabled = False
+        log("⏹ Scheduler disabled")
+
+    if st.button("🧹 Clear logs"):
+        st.session_state.log_lines = []
+
+    st.divider()
+    st.caption(
+        "⚠️ On Streamlit Community Cloud the app sleeps when the tab "
+        "is closed. Keep this page open for the scheduler to keep running."
+    )
+
+
+# ---------- Main UI ----------
+st.title("🌐 Selenium Visit Scheduler")
+
+chrome_path = ensure_chrome_binary()
+if chrome_path:
+    st.success(f"✅ Chrome found: `{chrome_path}`")
+else:
+    st.warning(
+        "⚠️ Chrome/Chromium not found. On Streamlit Cloud, add a "
+        "`packages.txt` file with:\n\n```\nchromium\nchromium-driver\n```\n\n"
+        "and a `requirements.txt` with `selenium`."
+    )
+
+status_col, cycle_col, next_col = st.columns(3)
+status_col.metric("Status",
+                  "🟢 Running" if st.session_state.scheduler_enabled else "🔴 Stopped")
+cycle_col.metric("Cycles completed", st.session_state.cycle_count)
+if st.session_state.scheduler_enabled and st.session_state.next_run_at:
+    remaining = max(0, int(st.session_state.next_run_at - time.time()))
+    next_col.metric("Next run in", f"{remaining} s")
+else:
+    next_col.metric("Next run in", "—")
+
+st.subheader("📜 Logs")
+log_box = st.empty()
+log_box.code("\n".join(st.session_state.log_lines[-100:]) or "(no logs yet)",
+             language="log")
+
+
+# ---------- Scheduler tick ----------
+# Runs on every rerun. If the timer has elapsed, does one visit and
+# schedules the next. Uses st.rerun() with a short sleep to keep UI alive.
+
+if st.session_state.scheduler_enabled:
+    now = time.time()
+
+    if now >= st.session_state.next_run_at:
+        # Time to visit
+        st.session_state.cycle_count += 1
+        log(f"\n===== CYCLE #{st.session_state.cycle_count} =====")
+
+        with st.spinner("Visiting site (this can take up to "
+                        f"{VISIT_DURATION_MINUTES} min)..."):
+            visit_site(chrome_path)
+
+        # Schedule next run
+        st.session_state.next_run_at = time.time() + WAIT_BETWEEN_MINUTES * 60
+        log(f"😴 Next visit scheduled in {WAIT_BETWEEN_MINUTES} min")
+
+        # Refresh UI so the browser stays responsive
+        st.rerun()
+    else:
+        # Not time yet — sleep briefly then rerun
+        time.sleep(5)
+        st.rerun()
+
+
+# ---------- Notes ----------
+with st.expander("ℹ️ How to make this work on Streamlit Cloud"):
+    st.markdown("""
+### Required files in your repo
+
+**`packages.txt`** (system packages, installed via apt):
