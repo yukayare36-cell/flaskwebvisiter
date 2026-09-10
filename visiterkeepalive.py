@@ -14,7 +14,7 @@ import platform
 import shutil
 
 # ============ CONFIGURATION ============
-TARGET_URL = "https://example.com"
+TARGET_URL = "https://freecash.pythonanywhere.com"
 VISIT_DURATION_MINUTES = 5
 WAIT_BETWEEN_MINUTES = 10
 PAGE_LOAD_TIMEOUT_SECONDS = 30     # fail fast instead of hanging
