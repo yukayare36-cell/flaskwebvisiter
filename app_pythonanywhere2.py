@@ -414,7 +414,7 @@ if __name__ == '__main__':
     print("=" * 60)
     
     try:
-        app.run(host='0.0.0.0', port=5000, debug=False)
+        app.run(host='0.0.0.0', port=5730, debug=False)
     finally:
         if driver:
             driver.quit()
